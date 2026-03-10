@@ -84,7 +84,9 @@ class PiSugarButtonListener:
             )
             self._button.when_released = self._on_released
             self._button.when_held = self._on_held
-            self.available = True
+            self._button_active = True
+            # self.available intentionally stays False — it signals *battery* hardware
+            # presence to display.py / webapp_modern.py.  There is no battery here.
             logger.info(f"GPIO button listener active on BCM pin {self._pin}")
         except Exception as e:
             logger.warning(
@@ -236,6 +238,6 @@ class PiSugarButtonListener:
 
     def get_model(self):
         """Return a short description of the hardware in use."""
-        if not self.available:
+        if not getattr(self, '_button_active', False):
             return None
         return f"GPIO Button (BCM {self._pin})"
