@@ -1,21 +1,27 @@
 # pisugar_button.py
 """
-PiSugar 3 button listener for Ragnar.
+GPIO button listener for Ragnar (replaces PiSugar 3 button module).
 
-Monitors the PiSugar button and triggers mode swaps between Ragnar and Pwnagotchi:
-  - Double tap:  Switch to Pwnagotchi (from Ragnar) or switch to Ragnar (from Pwnagotchi)
-  - Long press:  Same as double tap (alternative trigger for reliability)
+Monitors a plain momentary push-button wired between a GPIO pin and GND and
+triggers mode swaps between Ragnar and Pwnagotchi:
   - Single tap:  Toggle Ragnar manual mode on/off
+  - Double tap:  Switch to Pwnagotchi (or back to Ragnar)
+  - Long press:  Switch to Pwnagotchi (alternative trigger for reliability)
 
-Requires pisugar-server running and the `pisugar` Python package.
-Connection is via TCP to localhost (default pisugar-server setup).
+Default pin: BCM 23. Override with the GPIO_BUTTON_PIN environment variable.
+
+If GPIO initialisation fails (gpiozero not installed, insufficient permissions,
+or pin already in use) the listener logs a warning and disables itself silently
+so the rest of Ragnar is unaffected.
+
+The class is intentionally named PiSugarButtonListener to preserve the existing
+import/instantiation in Ragnar.py without any changes to that file.
 """
 
 import os
 import threading
 import logging
 import time
-import math
 
 try:
     from logger import Logger
@@ -24,75 +30,129 @@ except Exception:
     import logging as _logging
     logger = _logging.getLogger("pisugar_button")
 
+# ── Tunable constants ──────────────────────────────────────────────────────────
+_DEFAULT_PIN = 23       # BCM pin number; wired to GND via a momentary button
+_TAP_WINDOW = 0.4       # seconds: window to detect a second tap for double-tap
+_LONG_PRESS_TIME = 1.0  # seconds: hold duration that triggers a long press
+_BOUNCE_TIME = 0.05     # seconds: debounce period (50 ms)
+_SWAP_COOLDOWN = 10     # seconds: minimum gap between swap triggers
+# ──────────────────────────────────────────────────────────────────────────────
+
 
 class PiSugarButtonListener:
-    """Listens to PiSugar 3 button events and triggers Ragnar/Pwnagotchi swap."""
-
-    MOCK_ENV = 'PISUGAR_MOCK'  # Set to "1" to simulate a PiSugar for UI testing
+    """GPIO button listener that preserves the PiSugar button interface for Ragnar."""
 
     def __init__(self, shared_data):
         self.shared_data = shared_data
-        self._thread = None
         self._stop_event = threading.Event()
-        self._server = None
-        self._swap_cooldown = 0  # Timestamp of last swap to prevent double triggers
+        self._swap_cooldown_ts = 0.0   # timestamp of last swap trigger
         self.available = False
-        self._mock = os.environ.get(self.MOCK_ENV, '') == '1'
+        self._button = None
+
+        # Resolve pin number from environment (falls back to _DEFAULT_PIN)
+        pin_env = os.environ.get('GPIO_BUTTON_PIN', '').strip()
+        try:
+            self._pin = int(pin_env) if pin_env else _DEFAULT_PIN
+        except ValueError:
+            logger.warning(
+                f"Invalid GPIO_BUTTON_PIN value '{pin_env}', using default BCM {_DEFAULT_PIN}"
+            )
+            self._pin = _DEFAULT_PIN
+
+        # Tap-detection state
+        self._lock = threading.Lock()
+        self._last_release_ts = 0.0        # time of the most recent release
+        self._pending_single_timer = None  # Timer that fires a deferred single tap
+        self._held_fired = False           # True while a long-press has been dispatched
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     def start(self):
-        """Start the button listener in a background thread."""
-        if self._mock:
-            self.available = True
-            self._mock_start = time.time()
-            logger.info("PiSugar MOCK mode active (set PISUGAR_MOCK=1)")
+        """Set up the GPIO button.  Silently disables itself on any failure."""
+        try:
+            from gpiozero import Button
+        except ImportError:
+            logger.warning("gpiozero not installed — GPIO button listener disabled")
             return
-        self._thread = threading.Thread(target=self._run, name="pisugar-button", daemon=True)
-        self._thread.start()
+
+        try:
+            self._button = Button(
+                self._pin,
+                pull_up=True,              # internal pull-up; button connects pin to GND
+                hold_time=_LONG_PRESS_TIME,
+                bounce_time=_BOUNCE_TIME,
+            )
+            self._button.when_released = self._on_released
+            self._button.when_held = self._on_held
+            self.available = True
+            logger.info(f"GPIO button listener active on BCM pin {self._pin}")
+        except Exception as e:
+            logger.warning(
+                f"GPIO button init failed (BCM pin {self._pin}): {e} — listener disabled"
+            )
 
     def stop(self):
-        """Stop the listener."""
+        """Stop the listener and release GPIO resources."""
         self._stop_event.set()
-
-    def _run(self):
-        """Main loop: connect to pisugar-server and register button handlers."""
-        try:
-            from pisugar import connect_tcp, PiSugarServer
-        except ImportError:
-            logger.info("pisugar package not installed - button listener disabled")
-            return
-
-        # Retry connection with backoff (pisugar-server may start after Ragnar)
-        for attempt in range(5):
-            if self._stop_event.is_set():
-                return
+        with self._lock:
+            if self._pending_single_timer is not None:
+                self._pending_single_timer.cancel()
+                self._pending_single_timer = None
+        if self._button is not None:
             try:
-                conn, event_conn = connect_tcp('127.0.0.1')
-                self._server = PiSugarServer(conn, event_conn)
-                model = self._server.get_model()
-                logger.info(f"PiSugar connected: {model}")
-                self.available = True
-                break
-            except Exception as e:
-                wait = 5 * (attempt + 1)
-                logger.debug(f"PiSugar not available (attempt {attempt + 1}/5): {e}. Retry in {wait}s")
-                self._stop_event.wait(wait)
-        else:
-            logger.info("PiSugar not detected after 5 attempts - button listener disabled")
-            return
+                self._button.close()
+            except Exception:
+                pass
 
-        # Register button event handlers
-        try:
-            self._server.register_single_tap_handler(self._on_single_tap)
-            self._server.register_double_tap_handler(self._on_double_tap)
-            self._server.register_long_tap_handler(self._on_long_tap)
-            logger.info("PiSugar button handlers registered (single=manual_mode, double/long=swap)")
-        except Exception as e:
-            logger.error(f"Failed to register PiSugar button handlers: {e}")
-            return
+    # ── GPIO callbacks (called from gpiozero's internal thread) ───────────────
 
-        # Keep thread alive to receive events (pisugar library uses the event connection)
-        while not self._stop_event.is_set():
-            self._stop_event.wait(1)
+    def _on_held(self):
+        """Fires after the button has been held for _LONG_PRESS_TIME seconds."""
+        # Cancel any pending single-tap timer — long press takes priority
+        with self._lock:
+            self._held_fired = True
+            if self._pending_single_timer is not None:
+                self._pending_single_timer.cancel()
+                self._pending_single_timer = None
+        self._on_long_tap()
+
+    def _on_released(self):
+        """Fires on every button release; classifies as single- or double-tap."""
+        # If a long press was already handled, consume the release and reset the flag
+        with self._lock:
+            if self._held_fired:
+                self._held_fired = False
+                return
+
+        now = time.time()
+
+        with self._lock:
+            elapsed_since_last = now - self._last_release_ts
+            self._last_release_ts = now
+
+            if elapsed_since_last < _TAP_WINDOW:
+                # Second tap within the window → double tap
+                if self._pending_single_timer is not None:
+                    self._pending_single_timer.cancel()
+                    self._pending_single_timer = None
+                # Run handler off this callback thread to avoid blocking gpiozero
+                threading.Thread(target=self._on_double_tap, daemon=True).start()
+            else:
+                # Could be the first tap of a double tap; defer the single-tap action
+                if self._pending_single_timer is not None:
+                    self._pending_single_timer.cancel()
+                t = threading.Timer(_TAP_WINDOW, self._fire_single_tap)
+                t.daemon = True
+                self._pending_single_timer = t
+                t.start()
+
+    def _fire_single_tap(self):
+        """Called by the deferred timer when no second tap arrived."""
+        with self._lock:
+            self._pending_single_timer = None
+        self._on_single_tap()
+
+    # ── Action handlers ────────────────────────────────────────────────────────
 
     def _on_single_tap(self):
         """Single tap: toggle Ragnar manual mode."""
@@ -105,12 +165,12 @@ class PiSugarButtonListener:
             if ragnar:
                 if new_mode:
                     ragnar.stop_orchestrator()
-                    logger.info("PiSugar tap: manual mode ON (orchestrator stopped)")
+                    logger.info("GPIO tap: manual mode ON (orchestrator stopped)")
                 else:
                     ragnar.start_orchestrator()
-                    logger.info("PiSugar tap: manual mode OFF (orchestrator started)")
+                    logger.info("GPIO tap: manual mode OFF (orchestrator started)")
         except Exception as e:
-            logger.error(f"PiSugar single tap handler error: {e}")
+            logger.error(f"GPIO single tap handler error: {e}")
 
     def _on_double_tap(self):
         """Double tap: swap between Ragnar and Pwnagotchi."""
@@ -121,88 +181,61 @@ class PiSugarButtonListener:
         self._trigger_swap()
 
     def _trigger_swap(self):
-        """Trigger a mode swap with cooldown to prevent double triggers."""
+        """Trigger a mode swap with a cooldown to prevent accidental double triggers."""
         now = time.time()
-        if now - self._swap_cooldown < 10:
-            logger.debug("PiSugar swap ignored - cooldown active")
+        if now - self._swap_cooldown_ts < _SWAP_COOLDOWN:
+            logger.debug("GPIO button swap ignored — cooldown active")
             return
-        self._swap_cooldown = now
+        self._swap_cooldown_ts = now
 
         try:
-            # Determine current mode and swap to the other
             current_mode = self.shared_data.config.get('pwnagotchi_mode', 'ragnar')
             target = 'pwnagotchi' if current_mode != 'pwnagotchi' else 'ragnar'
 
-            logger.info(f"PiSugar button: swapping to {target}")
+            logger.info(f"GPIO button: swapping to {target}")
 
-            # Import the swap function from webapp_modern
-            from webapp_modern import _schedule_pwn_mode_switch, _write_pwn_status_file, _update_pwn_config, _emit_pwn_status_update
-            _write_pwn_status_file('switching', f'Button-triggered swap to {target}', 'swap', {'target_mode': target})
-            _update_pwn_config({'pwnagotchi_mode': target, 'pwnagotchi_last_status': f'Swapping to {target} (button)'})
+            from webapp_modern import (
+                _schedule_pwn_mode_switch,
+                _write_pwn_status_file,
+                _update_pwn_config,
+                _emit_pwn_status_update,
+            )
+            _write_pwn_status_file(
+                'switching',
+                f'Button-triggered swap to {target}',
+                'swap',
+                {'target_mode': target},
+            )
+            _update_pwn_config({
+                'pwnagotchi_mode': target,
+                'pwnagotchi_last_status': f'Swapping to {target} (button)',
+            })
             _emit_pwn_status_update()
             _schedule_pwn_mode_switch(target)
 
         except Exception as e:
-            logger.error(f"PiSugar swap trigger failed: {e}")
+            logger.error(f"GPIO button swap trigger failed: {e}")
 
-    # ── Mock helpers (sinusoidal cycle: drains then charges over ~2 min) ──
-
-    def _mock_level(self):
-        """Simulate battery level oscillating between 15% and 95%."""
-        elapsed = time.time() - self._mock_start
-        return 55 + 40 * math.sin(elapsed * math.pi / 60)  # ~2 min full cycle
-
-    def _mock_charging(self):
-        """Charging when the simulated level is rising."""
-        elapsed = time.time() - self._mock_start
-        return math.cos(elapsed * math.pi / 60) < 0  # rising half of sine
-
-    # ── Public getters (real or mock) ──────────────────────────────────
+    # ── Public getters (battery API stubs — no battery hardware present) ───────
+    #
+    # webapp_modern.py and display.py both call these methods on the listener
+    # object.  Since there is no PiSugar battery, all battery values are None.
+    # The callers already guard against None returns.
 
     def get_battery_level(self):
-        """Get battery percentage (for display/status use)."""
-        if self._mock:
-            return self._mock_level()
-        if not self._server:
-            return None
-        try:
-            return self._server.get_battery_level()
-        except Exception:
-            return None
+        """No battery hardware present; always returns None."""
+        return None
 
     def is_charging(self):
-        """Check if battery is charging (uses power_plugged with fallback to charging flag)."""
-        if self._mock:
-            return self._mock_charging()
-        if not self._server:
-            return None
-        try:
-            return self._server.get_battery_power_plugged()
-        except Exception:
-            pass
-        try:
-            return self._server.get_battery_charging()
-        except Exception:
-            return None
+        """No battery hardware present; always returns None."""
+        return None
 
     def get_battery_voltage(self):
-        """Get battery voltage in volts."""
-        if self._mock:
-            return 3.7 + (self._mock_level() - 50) * 0.012  # ~3.1V–4.3V range
-        if not self._server:
-            return None
-        try:
-            return self._server.get_battery_voltage()
-        except Exception:
-            return None
+        """No battery hardware present; always returns None."""
+        return None
 
     def get_model(self):
-        """Get PiSugar model name."""
-        if self._mock:
-            return 'PiSugar 3 (Mock)'
-        if not self._server:
+        """Return a short description of the hardware in use."""
+        if not self.available:
             return None
-        try:
-            return self._server.get_model()
-        except Exception:
-            return None
+        return f"GPIO Button (BCM {self._pin})"
