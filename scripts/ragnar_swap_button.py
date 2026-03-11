@@ -24,6 +24,7 @@ log = logging.getLogger()
 
 COOLDOWN = 10  # seconds between swap attempts
 KEY1_PIN = 5   # GPIO pin for 2.7" EPD HAT KEY1
+GPIO_BTN_PIN = 23  # GPIO pin for plain momentary button (BCM 23)
 
 last_swap = 0
 
@@ -61,23 +62,29 @@ def swap_to_ragnar():
 
 
 def start_gpio_listener():
-    """Start listening on GPIO KEY1 (pin 5) for 2.7 inch EPD HAT button."""
+    """Start listening on GPIO KEY1 (pin 5) and plain button (pin 23)."""
     try:
         from gpiozero import Button
     except ImportError:
         log.info("gpiozero not available - GPIO button listener disabled")
         return False
 
-    try:
-        btn = Button(KEY1_PIN, pull_up=True, bounce_time=0.3)
-        btn.when_pressed = lambda: swap_to_ragnar()
-        # prevent garbage collection
-        start_gpio_listener._btn = btn
-        log.info(f"GPIO KEY1 (pin {KEY1_PIN}) listener started")
-        return True
-    except Exception as e:
-        log.warning(f"Could not start GPIO listener on pin {KEY1_PIN}: {e}")
-        return False
+    started = False
+    btns = []
+
+    for pin in (KEY1_PIN, GPIO_BTN_PIN):
+        try:
+            btn = Button(pin, pull_up=True, bounce_time=0.3)
+            btn.when_pressed = lambda: swap_to_ragnar()
+            btns.append(btn)
+            log.info(f"GPIO listener started on BCM pin {pin}")
+            started = True
+        except Exception as e:
+            log.warning(f"Could not start GPIO listener on pin {pin}: {e}")
+
+    # prevent garbage collection
+    start_gpio_listener._btns = btns
+    return started
 
 
 def start_pisugar_listener():
