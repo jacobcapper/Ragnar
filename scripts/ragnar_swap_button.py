@@ -18,9 +18,58 @@ import subprocess
 import time
 import sys
 import logging
+import json
+import os
 
 logging.basicConfig(level=logging.INFO, format='[ragnar-swap] %(message)s')
 log = logging.getLogger()
+
+
+def show_transition_screen():
+    """Show 'Switching to Ragnar...' on the e-paper display."""
+    try:
+        import sys
+        sys.path.insert(0, '/home/ragnar/Ragnar')
+
+        # Read epd_type from config
+        config_path = '/home/ragnar/Ragnar/config/shared_config.json'
+        epd_type = 'epd2in13_V4'
+        screen_reversed = False
+        try:
+            with open(config_path) as f:
+                cfg = json.load(f)
+                epd_type = cfg.get('epd_type', epd_type)
+                screen_reversed = cfg.get('screen_reversed', False)
+        except Exception:
+            pass
+
+        epd_module = __import__(f'waveshare_epd.{epd_type}', fromlist=[epd_type])
+        epd = epd_module.EPD()
+        epd.init()
+
+        from PIL import Image, ImageDraw, ImageFont
+        w, h = epd.height, epd.width  # landscape: height=250, width=122
+        image = Image.new('1', (w, h), 255)
+        draw = ImageDraw.Draw(image)
+
+        try:
+            font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 14)
+            font_sm = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 10)
+        except Exception:
+            font = ImageFont.load_default()
+            font_sm = font
+
+        draw.text((10, h // 2 - 20), 'Switching to Ragnar...', font=font, fill=0)
+        draw.text((10, h // 2 + 5), 'Please wait...', font=font_sm, fill=0)
+
+        if screen_reversed:
+            image = image.rotate(180)
+
+        epd.display(epd.getbuffer(image))
+        epd.sleep()
+        log.info('Transition screen shown on e-paper')
+    except Exception as e:
+        log.warning(f'Could not show transition screen: {e}')
 
 COOLDOWN = 10  # seconds between swap attempts
 KEY1_PIN = 5   # GPIO pin for 2.7" EPD HAT KEY1
@@ -43,6 +92,7 @@ def swap_to_ragnar():
     last_swap = now
 
     log.info("Button triggered: swapping to Ragnar...")
+    show_transition_screen()
     try:
         subprocess.Popen(
             ['systemd-run', '--no-block', '--collect',
